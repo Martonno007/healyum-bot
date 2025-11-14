@@ -1,81 +1,37 @@
+// ---------- ENV & IMPORT ----------
+
 require('dotenv').config();
+
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
-const cors = require('cors');                 
-const { createClient } = require('@supabase/supabase-js');
+const cors = require('cors');
 
 // ---- ENV ----
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN mancante nel .env');
+  process.exit(1);
+}
+
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('❌ SUPABASE_URL o SUPABASE_SERVICE_KEY mancanti nel .env');
   process.exit(1);
 }
 
-// ---- CLIENTS ----
+// ---------- CLIENTS ----------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const app = express();
 
-// ✅ CORS E JSON **SUBITO** DOPO AVER CREATO `app`
-app.use(cors());          // permette alla mini-app su Vercel di chiamare il bot
+// ---------- MIDDLEWARE ----------
+app.use(cors());          // permette alla mini-app di chiamare il backend
 app.use(express.json());
 
-app.get('/market/today', async (req, res) => {
-  try {
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-
-    const { data: market, error } = await supabase
-      .from('markets')
-      .select('*')
-      .eq('symbol', 'TSLA')
-      .eq('date', today)
-      .single();
-
-    if (error) {
-      console.error('Supabase error /market/today:', error.message);
-      return res.status(500).json({ error: 'supabase_error' });
-    }
-
-    if (!market) {
-      return res.status(404).json({ error: 'no_market' });
-    }
-
-    res.json(market);
-  } catch (err) {
-    console.error('Unexpected /market/today:', err);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-
-// ---------- SUPABASE ----------
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-  console.error("❌ SUPABASE_URL o SUPABASE_SERVICE_KEY mancanti nel .env");
-  process.exit(1);
-}
-
-const { createClient } = require("@supabase/supabase-js");
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
-
-
-// ---------- TELEGRAM ----------
-const token = process.env.BOT_TOKEN;
-if (!token) {
-  console.error('❌ BOT_TOKEN mancante nel .env');
-  process.exit(1);
-}
-
-const bot = new TelegramBot(token, { polling: true });
-app.use(cors());  // <-- AGGIUNTO
-
+// ---------- COSTANTI ----------
 const WEB_APP_URL = 'https://healyum-miniapp-cmdb.vercel.app/';
 const FEE = 0.02;
 
@@ -102,6 +58,7 @@ async function getOrCreateTodayMarket() {
     .eq('id', marketId)
     .single();
 
+  // Se non esiste, lo creo
   if (!market) {
     const { data, error: insErr } = await supabase
       .from('markets')
@@ -115,16 +72,19 @@ async function getOrCreateTodayMarket() {
       })
       .select()
       .single();
+
     if (insErr) throw insErr;
     market = data;
   } else if (error && error.code !== 'PGRST116') {
+    // errore diverso da "no rows"
     throw error;
   }
 
   return market;
 }
 
-// ---------- BOT EVENTS ----------
+// ---------- TELEGRAM BOT ----------
+
 bot.on('polling_error', (err) => console.error('Polling error:', err));
 
 bot.onText(/\/start/, (msg) => {
@@ -146,15 +106,17 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// /status
+// /status – mostra la situazione del mercato di oggi
 bot.onText(/\/status/, async (msg) => {
   try {
     const marketId = getTodayMarketId();
-    const { data: market } = await supabase
+    const { data: market, error } = await supabase
       .from('markets')
       .select('id,status,up_pool,down_pool')
       .eq('id', marketId)
       .single();
+
+    if (error && error.code !== 'PGRST116') throw error;
 
     if (!market) {
       return bot.sendMessage(
@@ -173,13 +135,13 @@ bot.onText(/\/status/, async (msg) => {
   }
 });
 
-// /resolve_up /resolve_down
+// /resolve_up e /resolve_down
 bot.onText(/\/resolve_(up|down)/, async (msg, match) => {
-  const winningSide = match[1].toUpperCase();
+  const winningSide = match[1].toUpperCase(); // 'UP' | 'DOWN'
   await resolveTodayMarket(msg.chat.id, winningSide);
 });
 
-// handler generico
+// handler generico (per i dati della mini-app)
 bot.on('message', async (msg) => {
   console.log('New message:', JSON.stringify(msg, null, 2));
   if (msg.web_app_data && msg.web_app_data.data) {
@@ -188,6 +150,7 @@ bot.on('message', async (msg) => {
 });
 
 // ---------- WEBAPP HANDLER ----------
+
 async function handleWebAppData(msg) {
   try {
     const payload = JSON.parse(msg.web_app_data.data);
@@ -195,7 +158,7 @@ async function handleWebAppData(msg) {
 
     if (payload.type !== 'BET') return;
 
-    const rawSide = payload.side;
+    const rawSide = payload.side;              // "TESLA_UP" | "TESLA_DOWN"
     const side = rawSide === 'TESLA_UP' ? 'UP' : 'DOWN';
     const stake = Number(payload.stake || 1);
 
@@ -206,6 +169,7 @@ async function handleWebAppData(msg) {
       return bot.sendMessage(msg.chat.id, `❌ Market ${market.id} is not open.`);
     }
 
+    // salvo la bet
     await supabase.from('bets').insert({
       user_id: userId,
       market_id: market.id,
@@ -213,6 +177,7 @@ async function handleWebAppData(msg) {
       stake
     });
 
+    // aggiorno le pool
     const newUpPool = market.up_pool + (side === 'UP' ? stake : 0);
     const newDownPool = market.down_pool + (side === 'DOWN' ? stake : 0);
 
@@ -232,6 +197,7 @@ async function handleWebAppData(msg) {
 }
 
 // ---------- RESOLUTION LOGIC ----------
+
 async function resolveTodayMarket(chatId, winningSide) {
   const marketId = getTodayMarketId();
 
@@ -249,7 +215,6 @@ async function resolveTodayMarket(chatId, winningSide) {
   const upPool = market.up_pool;
   const downPool = market.down_pool;
   const totalPool = upPool + downPool;
-
   const winnersPool = winningSide === 'UP' ? upPool : downPool;
 
   const distributable = totalPool * (1 - FEE);
@@ -278,24 +243,37 @@ async function resolveTodayMarket(chatId, winningSide) {
 }
 
 // ---------- EXPRESS API ----------
+
 app.get('/', (_, res) => res.send('Healyum bot running 🟢'));
 
+// usato dalla mini-app per mostrare le pool live
 app.get('/market/today', async (_, res) => {
-  const marketId = getTodayMarketId();
-  const { data: market } = await supabase
-    .from('markets')
-    .select('id,status,up_pool,down_pool')
-    .eq('id', marketId)
-    .single();
+  try {
+    const marketId = getTodayMarketId();
+    const { data: market, error } = await supabase
+      .from('markets')
+      .select('id,status,up_pool,down_pool')
+      .eq('id', marketId)
+      .single();
 
-  if (!market) return res.status(404).json({ error: 'no market' });
+    if (error && error.code !== 'PGRST116') {
+      console.error('Supabase error /market/today:', error.message);
+      return res.status(500).json({ error: 'supabase_error' });
+    }
 
-  res.json(market);
+    if (!market) {
+      return res.status(404).json({ error: 'no market' });
+    }
+
+    res.json(market);
+  } catch (err) {
+    console.error('Unexpected /market/today:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
 });
 
 // ---------- LISTEN ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`Server Healyum running on port ${PORT}`)
-);
-
+app.listen(PORT, () => {
+  console.log(`Server Healyum running on port ${PORT}`);
+});
