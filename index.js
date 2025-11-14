@@ -27,7 +27,7 @@ app.use(cors());
 app.use(express.json());
 
 // ---------- COSTANTI ----------
-const WEB_APP_URL = "https://healyum-miniapp-cmdb.vercel.app/";
+const WEB_APP_URL = "https://healyum-miniapp-cmdb.vercel.app/?v=2";
 const FEE = 0.02;
 
 // ---------- UTILS ----------
