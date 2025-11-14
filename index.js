@@ -2,16 +2,69 @@ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
-const cors = require('cors');   // <-- AGGIUNTO
+const cors = require('cors');                 
+const { createClient } = require('@supabase/supabase-js');
 
-// ---------- SUPABASE ----------
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-if (!supabaseUrl || !supabaseKey) {
+// ---- ENV ----
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('❌ SUPABASE_URL o SUPABASE_SERVICE_KEY mancanti nel .env');
   process.exit(1);
 }
-const supabase = createClient(supabaseUrl, supabaseKey);
+
+// ---- CLIENTS ----
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const app = express();
+
+// ✅ CORS E JSON **SUBITO** DOPO AVER CREATO `app`
+app.use(cors());          // permette alla mini-app su Vercel di chiamare il bot
+app.use(express.json());
+
+app.get('/market/today', async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+    const { data: market, error } = await supabase
+      .from('markets')
+      .select('*')
+      .eq('symbol', 'TSLA')
+      .eq('date', today)
+      .single();
+
+    if (error) {
+      console.error('Supabase error /market/today:', error.message);
+      return res.status(500).json({ error: 'supabase_error' });
+    }
+
+    if (!market) {
+      return res.status(404).json({ error: 'no_market' });
+    }
+
+    res.json(market);
+  } catch (err) {
+    console.error('Unexpected /market/today:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+
+// ---------- SUPABASE ----------
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+  console.error("❌ SUPABASE_URL o SUPABASE_SERVICE_KEY mancanti nel .env");
+  process.exit(1);
+}
+
+const { createClient } = require("@supabase/supabase-js");
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
 
 // ---------- TELEGRAM ----------
 const token = process.env.BOT_TOKEN;
@@ -21,7 +74,6 @@ if (!token) {
 }
 
 const bot = new TelegramBot(token, { polling: true });
-const app = express();
 app.use(cors());  // <-- AGGIUNTO
 
 const WEB_APP_URL = 'https://healyum-miniapp-cmdb.vercel.app/';
