@@ -319,46 +319,81 @@ async function resolveTodayMarket(chatId, winningSide) {
 // ---------- CRON ROUTE (OPZIONE B: chiamata da Google Cron) ----------
 app.get("/cron/daily", async (req, res) => {
   try {
-    const secret = req.query.secret;
-    if (!CRON_SECRET || secret !== CRON_SECRET) {
-      return res.status(403).json({ ok: false, error: "forbidden" });
+    if (req.query.secret !== CRON_SECRET) {
+      return res.status(403).json({ error: "forbidden" });
     }
 
-    const lockTimeUtc = getTodayLockTimeUtc();
-    const now = nowUtc();
+    // Ora italiana
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    
+    // Ieri
+    const yesterdayDate = new Date(now);
+    yesterdayDate.setDate(now.getDate() - 1);
+    const yesterday = yesterdayDate.toISOString().slice(0, 10);
 
-    let market = await getTodayMarketIfExists();
+    const marketIdYesterday = `TSLA-${yesterday}`;
+    const marketIdToday = `TSLA-${today}`;
 
-    // 1) Se non c'è ancora un mercato per oggi, crealo e aprilo
-    if (!market) {
-      market = await getOrCreateTodayMarket();
-      console.log("Cron: created market", market.id);
-      return res.json({ ok: true, action: "created", marketId: market.id });
-    }
+    // 1️⃣ CHIUDI IL MERCATO DI IERI SE ESISTE
+    const { data: oldMarket } = await supabase
+      .from("markets")
+      .select("*")
+      .eq("id", marketIdYesterday)
+      .single();
 
-    // 2) Se esiste ed è OPEN e siamo oltre l'ora di lock -> LOCKED
-    if (market.status === "OPEN" && now >= lockTimeUtc) {
+    if (oldMarket && oldMarket.status === "OPEN") {
+
       await supabase
         .from("markets")
-        .update({ status: "LOCKED", locked_at: new Date().toISOString() })
-        .eq("id", market.id);
+        .update({
+          status: "LOCKED",
+          locked_at: now.toISOString()
+        })
+        .eq("id", marketIdYesterday);
 
-      console.log("Cron: locked market", market.id);
-      return res.json({ ok: true, action: "locked", marketId: market.id });
+      console.log("Locked yesterday’s market:", marketIdYesterday);
     }
 
-    // 3) Altrimenti non fa nulla
+    // 2️⃣ CREA SEMPRE il nuovo mercato OGGI
+    const { data: existingToday } = await supabase
+      .from("markets")
+      .select("*")
+      .eq("id", marketIdToday)
+      .single();
+
+    if (!existingToday) {
+      await supabase.from("markets").insert({
+        id: marketIdToday,
+        underlying: "TSLA",
+        date: today,
+        status: "OPEN",
+        up_pool: 0,
+        down_pool: 0,
+        opened_at: now.toISOString()
+      });
+
+      console.log("Created today’s market:", marketIdToday);
+
+      return res.json({
+        ok: true,
+        action: "created_new_market",
+        marketId: marketIdToday
+      });
+    }
+
     return res.json({
       ok: true,
-      action: "none",
-      marketId: market.id,
-      status: market.status,
+      action: "market_already_exists",
+      marketId: marketIdToday
     });
-  } catch (e) {
-    console.error("Error in /cron/daily:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
+
+  } catch (err) {
+    console.error("CRON ERROR", err);
+    res.status(500).json({ error: "server_error" });
   }
 });
+
 
 // ---------- EXPRESS API ----------
 app.get("/", (_, res) => res.send("Healyum bot running 🟢"));
