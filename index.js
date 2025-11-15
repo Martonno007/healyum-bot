@@ -8,7 +8,7 @@ const cors = require("cors");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const CRON_SECRET = process.env.CRON_SECRET; // <-- usato per proteggere /cron/daily
+const CRON_SECRET = process.env.CRON_SECRET; // usato per proteggere /cron/daily
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN mancante nel .env");
@@ -35,44 +35,38 @@ app.use(express.json());
 const WEB_APP_URL = "https://healyum-miniapp.vercel.app/";
 const FEE = 0.02;
 
-// 15:30 Europe/Rome in UTC (14:30 d’inverno, 13:30 d’estate).
-const DAILY_LOCK_HOUR_UTC = 14;   // orario di chiusura approssimato in UTC
-const DAILY_LOCK_MINUTE_UTC = 30; // 14:30 UTC ≈ 15:30 Italia (senza gestire DST perfetto)
-
 // ---------- UTILS ----------
 
 /**
- * Calcola l'ID del mercato per "oggi" in fuso Europe/Rome.
- * Esempio: TSLA-2025-11-15
+ * Ritorna "YYYY-MM-DD" calcolato nel fuso Europe/Rome
  */
-function getMarketIdForTodayRome() {
-  const now = new Date();
+function getRomeDateStr(date = new Date()) {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Rome",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   });
-  const [{ value: year }, , { value: month }, , { value: day }] = fmt.formatToParts(now);
-  const dateStr = `${year}-${month}-${day}`;
+
+  const [{ value: year }, , { value: month }, , { value: day }] =
+    fmt.formatToParts(date);
+
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Ritorna { id: "TSLA-YYYY-MM-DD", dateStr: "YYYY-MM-DD" } per la data data.
+ */
+function getMarketIdForRomeDate(date = new Date()) {
+  const dateStr = getRomeDateStr(date);
   return { id: `TSLA-${dateStr}`, dateStr };
 }
 
 /**
- * Ritorna l'orario attuale in UTC (Date) – ci serve per confrontare con l’ora di lock.
+ * ID mercato di oggi in fuso Europe/Rome.
  */
-function nowUtc() {
-  return new Date(new Date().toISOString());
-}
-
-/**
- * orario di lock in UTC per "oggi" (semplificato, senza DST dinamico).
- */
-function getTodayLockTimeUtc() {
-  const now = nowUtc();
-  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
-    DAILY_LOCK_HOUR_UTC, DAILY_LOCK_MINUTE_UTC, 0));
-  return d;
+function getMarketIdForTodayRome() {
+  return getMarketIdForRomeDate(new Date());
 }
 
 /**
@@ -180,7 +174,9 @@ bot.onText(/\/status/, async (msg) => {
 
     const minutesOpen = getMinutesSinceOpened(market);
     const ageText =
-      minutesOpen != null ? `Open since ${minutesOpen} minutes.` : "Opened_at not set.";
+      minutesOpen != null
+        ? `Open since ${minutesOpen} minutes.`
+        : "Opened_at not set.";
 
     bot.sendMessage(
       msg.chat.id,
@@ -297,10 +293,7 @@ async function resolveTodayMarket(chatId, winningSide) {
   for (const bet of bets || []) {
     if (bet.side === winningSide) {
       const payout = bet.stake * multiplier;
-      await supabase
-        .from("bets")
-        .update({ payout })
-        .eq("id", bet.id);
+      await supabase.from("bets").update({ payout }).eq("id", bet.id);
       bot.sendMessage(
         bet.user_id,
         `🎉 You WON on ${market.id}! Payout: ${payout.toFixed(2)}`
@@ -316,84 +309,83 @@ async function resolveTodayMarket(chatId, winningSide) {
   bot.sendMessage(chatId, `Market ${market.id} resolved.`);
 }
 
-// ---------- CRON ROUTE (OPZIONE B: chiamata da Google Cron) ----------
+// ---------- CRON ROUTE (chiamata da Google Cron alle 15:30 Europe/Rome) ----------
 app.get("/cron/daily", async (req, res) => {
   try {
     if (req.query.secret !== CRON_SECRET) {
       return res.status(403).json({ error: "forbidden" });
     }
 
-    // Ora italiana
     const now = new Date();
-    const today = now.toISOString().slice(0, 10);
-    
-    // Ieri
+
+    // Oggi e ieri calcolati nel fuso Europe/Rome
+    const todayInfo = getMarketIdForRomeDate(now);
+
     const yesterdayDate = new Date(now);
-    yesterdayDate.setDate(now.getDate() - 1);
-    const yesterday = yesterdayDate.toISOString().slice(0, 10);
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const yesterdayInfo = getMarketIdForRomeDate(yesterdayDate);
 
-    const marketIdYesterday = `TSLA-${yesterday}`;
-    const marketIdToday = `TSLA-${today}`;
+    const marketIdYesterday = yesterdayInfo.id;
+    const marketIdToday = todayInfo.id;
 
-    // 1️⃣ CHIUDI IL MERCATO DI IERI SE ESISTE
+    // 1️⃣ CHIUDI IL MERCATO DI IERI SE ESISTE (LOCKED)
     const { data: oldMarket } = await supabase
       .from("markets")
       .select("*")
       .eq("id", marketIdYesterday)
       .single();
 
-    if (oldMarket && oldMarket.status === "OPEN") {
+    let lockedYesterday = false;
 
+    if (oldMarket && oldMarket.status === "OPEN") {
       await supabase
         .from("markets")
         .update({
           status: "LOCKED",
-          locked_at: now.toISOString()
+          locked_at: now.toISOString(),
         })
         .eq("id", marketIdYesterday);
 
+      lockedYesterday = true;
       console.log("Locked yesterday’s market:", marketIdYesterday);
     }
 
-    // 2️⃣ CREA SEMPRE il nuovo mercato OGGI
+    // 2️⃣ CREA SEMPRE il nuovo mercato OGGI (apertura nuovo pool)
     const { data: existingToday } = await supabase
       .from("markets")
       .select("*")
       .eq("id", marketIdToday)
       .single();
 
+    let createdToday = false;
+
     if (!existingToday) {
       await supabase.from("markets").insert({
         id: marketIdToday,
         underlying: "TSLA",
-        date: today,
+        date: todayInfo.dateStr,
         status: "OPEN",
         up_pool: 0,
         down_pool: 0,
-        opened_at: now.toISOString()
+        opened_at: now.toISOString(),
       });
 
+      createdToday = true;
       console.log("Created today’s market:", marketIdToday);
-
-      return res.json({
-        ok: true,
-        action: "created_new_market",
-        marketId: marketIdToday
-      });
     }
 
     return res.json({
       ok: true,
-      action: "market_already_exists",
-      marketId: marketIdToday
+      lockedYesterday,
+      createdToday,
+      marketIdYesterday,
+      marketIdToday,
     });
-
   } catch (err) {
     console.error("CRON ERROR", err);
     res.status(500).json({ error: "server_error" });
   }
 });
-
 
 // ---------- EXPRESS API ----------
 app.get("/", (_, res) => res.send("Healyum bot running 🟢"));
