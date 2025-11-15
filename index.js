@@ -35,22 +35,30 @@ app.use(express.json());
 const WEB_APP_URL = "https://healyum-miniapp.vercel.app/";
 const FEE = 0.02;
 
+// Orario di “cambio giorno” del pool in Europe/Rome
+const LOCK_HOUR = 15;
+const LOCK_MINUTE = 30;
+
 // ---------- UTILS ----------
 
 /**
- * Ritorna "YYYY-MM-DD" calcolato nel fuso Europe/Rome
+ * Restituisce un oggetto Date che rappresenta "ora" nel fuso Europe/Rome.
+ * (Stesso momento, ma con orario locale di Roma)
+ */
+function getRomeNow(baseDate = new Date()) {
+  return new Date(
+    baseDate.toLocaleString("en-US", { timeZone: "Europe/Rome" })
+  );
+}
+
+/**
+ * Restituisce "YYYY-MM-DD" calcolato nel fuso Europe/Rome
  */
 function getRomeDateStr(date = new Date()) {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Rome",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-
-  const [{ value: year }, , { value: month }, , { value: day }] =
-    fmt.formatToParts(date);
-
+  const rome = getRomeNow(date);
+  const year = rome.getFullYear();
+  const month = String(rome.getMonth() + 1).padStart(2, "0");
+  const day = String(rome.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
@@ -63,18 +71,37 @@ function getMarketIdForRomeDate(date = new Date()) {
 }
 
 /**
- * ID mercato di oggi in fuso Europe/Rome.
+ * Identifica il **mercato attivo in questo momento**.
+ *
+ * Regola:
+ *  - prima delle 15:30 Europe/Rome → mercato del GIORNO PRIMA
+ *  - dalle 15:30 in poi → mercato del GIORNO CORRENTE
  */
-function getMarketIdForTodayRome() {
-  return getMarketIdForRomeDate(new Date());
+function getActiveMarketIdRome(now = new Date()) {
+  const romeNow = getRomeNow(now);
+  const h = romeNow.getHours();
+  const m = romeNow.getMinutes();
+
+  const beforeLock =
+    h < LOCK_HOUR || (h === LOCK_HOUR && m < LOCK_MINUTE);
+
+  const effectiveDate = new Date(romeNow);
+
+  if (beforeLock) {
+    // prima delle 15:30 → il pool "attivo" è quello di ieri
+    effectiveDate.setDate(effectiveDate.getDate() - 1);
+  }
+  // altrimenti (dalle 15:30 in poi) → use today
+
+  return getMarketIdForRomeDate(effectiveDate);
 }
 
 /**
- * Crea o ritorna il mercato per "oggi" (fuso Europe/Rome),
- * settando opened_at solo alla creazione.
+ * Crea o ritorna il **mercato attivo** in questo momento.
+ * (Se è la prima volta che lo usi per quella giornata, lo crea)
  */
-async function getOrCreateTodayMarket() {
-  const { id: marketId, dateStr } = getMarketIdForTodayRome();
+async function getOrCreateActiveMarket() {
+  const { id: marketId, dateStr } = getActiveMarketIdRome();
 
   let { data: market, error } = await supabase
     .from("markets")
@@ -107,10 +134,10 @@ async function getOrCreateTodayMarket() {
 }
 
 /**
- * Ritorna il mercato di oggi, se esiste (senza crearlo).
+ * Ritorna il **mercato attivo**, se esiste (senza crearlo).
  */
-async function getTodayMarketIfExists() {
-  const { id: marketId } = getMarketIdForTodayRome();
+async function getActiveMarketIfExists() {
+  const { id: marketId } = getActiveMarketIdRome();
   const { data: market, error } = await supabase
     .from("markets")
     .select("*")
@@ -136,10 +163,10 @@ bot.on("polling_error", (err) => console.error("Polling error:", err));
 
 bot.onText(/\/start/, async (msg) => {
   try {
-    // opzionale: assicuriamo che il mercato di oggi esista
-    await getOrCreateTodayMarket();
+    // opzionale: assicuriamo che il mercato attivo esista
+    await getOrCreateActiveMarket();
   } catch (e) {
-    console.error("Error ensuring today market on /start:", e);
+    console.error("Error ensuring active market on /start:", e);
   }
 
   bot.sendMessage(
@@ -164,11 +191,11 @@ bot.onText(/\/start/, async (msg) => {
 
 bot.onText(/\/status/, async (msg) => {
   try {
-    const market = await getTodayMarketIfExists();
+    const market = await getActiveMarketIfExists();
     if (!market) {
       return bot.sendMessage(
         msg.chat.id,
-        "No market for today yet. It will open automatically at the US market open."
+        "No active market yet. It will open automatically at the US market open."
       );
     }
 
@@ -176,11 +203,11 @@ bot.onText(/\/status/, async (msg) => {
     const ageText =
       minutesOpen != null
         ? `Open since ${minutesOpen} minutes.`
-        : "Opened_at not set.";
+        : "opened_at not set.";
 
     bot.sendMessage(
       msg.chat.id,
-      `📊 Market ${market.id}\nStatus: ${market.status}\nUP pool: ${market.up_pool}\nDOWN pool: ${market.down_pool}\n${ageText}`
+      `📊 Active market: ${market.id}\nStatus: ${market.status}\nUP pool: ${market.up_pool}\nDOWN pool: ${market.down_pool}\n${ageText}`
     );
   } catch (e) {
     console.error(e);
@@ -213,7 +240,7 @@ async function handleWebAppData(msg) {
     const stake = Number(payload.stake || 1);
 
     const userId = await getOrCreateUser(msg.from);
-    const market = await getOrCreateTodayMarket();
+    const market = await getOrCreateActiveMarket();
 
     if (market.status !== "OPEN") {
       return bot.sendMessage(
@@ -256,10 +283,14 @@ async function getOrCreateUser(from) {
   return id;
 }
 
+/**
+ * Per ora lasciamo che /resolve_up e /resolve_down
+ * risolvano il mercato “attivo” in quel momento.
+ */
 async function resolveTodayMarket(chatId, winningSide) {
-  const market = await getTodayMarketIfExists();
+  const market = await getActiveMarketIfExists();
   if (!market) {
-    return bot.sendMessage(chatId, "No market for today.");
+    return bot.sendMessage(chatId, "No active market.");
   }
 
   const { data: bets } = await supabase
@@ -309,7 +340,7 @@ async function resolveTodayMarket(chatId, winningSide) {
   bot.sendMessage(chatId, `Market ${market.id} resolved.`);
 }
 
-// ---------- CRON ROUTE (chiamata da Google Cron alle 15:30 Europe/Rome) ----------
+// ---------- CRON ROUTE (chiamata una volta al giorno alle 15:30 Europe/Rome) ----------
 app.get("/cron/daily", async (req, res) => {
   try {
     if (req.query.secret !== CRON_SECRET) {
@@ -317,13 +348,15 @@ app.get("/cron/daily", async (req, res) => {
     }
 
     const now = new Date();
+    const romeNow = getRomeNow(now);
 
-    // Oggi e ieri calcolati nel fuso Europe/Rome
-    const todayInfo = getMarketIdForRomeDate(now);
+    // Mercato che sta FINENDO (pool precedente, aperto ieri alle 15:30)
+    const yesterdayRome = new Date(romeNow);
+    yesterdayRome.setDate(yesterdayRome.getDate() - 1);
+    const yesterdayInfo = getMarketIdForRomeDate(yesterdayRome);
 
-    const yesterdayDate = new Date(now);
-    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
-    const yesterdayInfo = getMarketIdForRomeDate(yesterdayDate);
+    // Mercato che sta PER INIZIARE (nuovo pool di oggi)
+    const todayInfo = getMarketIdForRomeDate(romeNow);
 
     const marketIdYesterday = yesterdayInfo.id;
     const marketIdToday = todayInfo.id;
@@ -350,7 +383,7 @@ app.get("/cron/daily", async (req, res) => {
       console.log("Locked yesterday’s market:", marketIdYesterday);
     }
 
-    // 2️⃣ CREA SEMPRE il nuovo mercato OGGI (apertura nuovo pool)
+    // 2️⃣ CREA SEMPRE il nuovo mercato OGGI (apertura nuovo pool alle 15:30)
     const { data: existingToday } = await supabase
       .from("markets")
       .select("*")
@@ -392,8 +425,9 @@ app.get("/", (_, res) => res.send("Healyum bot running 🟢"));
 
 app.get("/market/today", async (_, res) => {
   try {
-    const market = await getTodayMarketIfExists();
-    if (!market) return res.status(404).json({ error: "no market" });
+    // Qui "today" = mercato attivo secondo la regola delle 15:30
+    const market = await getActiveMarketIfExists();
+    if (!market) return res.status(404).json({ error: "no_market" });
 
     const minutesOpen = getMinutesSinceOpened(market);
     res.json({
