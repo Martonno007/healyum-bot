@@ -8,7 +8,7 @@ const cors = require("cors");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const CRON_SECRET = process.env.CRON_SECRET || "dev-secret-change-me";
+const CRON_SECRET = process.env.CRON_SECRET; // <-- usato per proteggere /cron/daily
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN mancante nel .env");
@@ -16,6 +16,10 @@ if (!BOT_TOKEN) {
 }
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error("❌ SUPABASE_URL o SUPABASE_SERVICE_KEY mancanti nel .env");
+  process.exit(1);
+}
+if (!CRON_SECRET) {
+  console.error("❌ CRON_SECRET mancante nel .env");
   process.exit(1);
 }
 
@@ -30,156 +34,120 @@ app.use(express.json());
 // ---------- COSTANTI ----------
 const WEB_APP_URL = "https://healyum-miniapp.vercel.app/";
 const FEE = 0.02;
-const UNDERLYING = "TSLA";
-const ROME_TZ = "Europe/Rome";
 
-// ---------- UTILS DATA ----------
+// 15:30 Europe/Rome in UTC (14:30 d’inverno, 13:30 d’estate).
+const DAILY_LOCK_HOUR_UTC = 14;   // orario di chiusura approssimato in UTC
+const DAILY_LOCK_MINUTE_UTC = 30; // 14:30 UTC ≈ 15:30 Italia (senza gestire DST perfetto)
 
-// Ritorna "YYYY-MM-DD" per la data in fuso orario Europe/Rome + offset in giorni
-function getRomeDateString(offsetDays = 0) {
+// ---------- UTILS ----------
+
+/**
+ * Calcola l'ID del mercato per "oggi" in fuso Europe/Rome.
+ * Esempio: TSLA-2025-11-15
+ */
+function getMarketIdForTodayRome() {
   const now = new Date();
-  // spostiamo di offsetDays
-  now.setUTCDate(now.getUTCDate() + offsetDays);
-
   const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: ROME_TZ,
+    timeZone: "Europe/Rome",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   });
-
-  return fmt.format(now); // es: "2025-11-14"
+  const [{ value: year }, , { value: month }, , { value: day }] = fmt.formatToParts(now);
+  const dateStr = `${year}-${month}-${day}`;
+  return { id: `TSLA-${dateStr}`, dateStr };
 }
 
-function getMarketIdForDateStr(dateStr) {
-  return `${UNDERLYING}-${dateStr}`;
+/**
+ * Ritorna l'orario attuale in UTC (Date) – ci serve per confrontare con l’ora di lock.
+ */
+function nowUtc() {
+  return new Date(new Date().toISOString());
 }
 
-// Market di "oggi" in fuso Roma
-function getTodayMarketId() {
-  return getMarketIdForDateStr(getRomeDateString(0));
+/**
+ * orario di lock in UTC per "oggi" (semplificato, senza DST dinamico).
+ */
+function getTodayLockTimeUtc() {
+  const now = nowUtc();
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(),
+    DAILY_LOCK_HOUR_UTC, DAILY_LOCK_MINUTE_UTC, 0));
+  return d;
 }
 
-// Market di "ieri" in fuso Roma
-function getYesterdayMarketId() {
-  return getMarketIdForDateStr(getRomeDateString(-1));
-}
+/**
+ * Crea o ritorna il mercato per "oggi" (fuso Europe/Rome),
+ * settando opened_at solo alla creazione.
+ */
+async function getOrCreateTodayMarket() {
+  const { id: marketId, dateStr } = getMarketIdForTodayRome();
 
-// ---------- UTILS SUPABASE ----------
-
-async function getMarketById(id, columns = "*") {
-  const { data, error } = await supabase
+  let { data: market, error } = await supabase
     .from("markets")
-    .select(columns)
-    .eq("id", id)
+    .select("*")
+    .eq("id", marketId)
     .single();
-
-  if (error && error.code !== "PGRST116") {
-    // 116 = no rows
-    throw error;
-  }
-  return data || null;
-}
-
-async function createOpenMarketForToday() {
-  const dateStr = getRomeDateString(0);
-  const marketId = getMarketIdForDateStr(dateStr);
-  const nowIso = new Date().toISOString();
-
-  const { data, error } = await supabase
-    .from("markets")
-    .insert({
-      id: marketId,
-      underlying: UNDERLYING,
-      date: dateStr,
-      status: "OPEN",
-      up_pool: 0,
-      down_pool: 0,
-      opened_at: nowIso,
-    })
-    .select()
-    .single();
-
-  if (error) throw error;
-  return data;
-}
-
-// Garantisce che il mercato di oggi esista e sia almeno OPEN.
-// NON chiude quello di ieri: questo lo fa il cron.
-async function getOrCreateTodayOpenMarket() {
-  const todayId = getTodayMarketId();
-  let market = await getMarketById(todayId);
 
   if (!market) {
-    console.log("[MARKET] Nessun market per oggi, lo creo ora:", todayId);
-    market = await createOpenMarketForToday();
-  } else if (market.status !== "OPEN") {
-    console.log("[MARKET] Market oggi esiste ma non è OPEN, lo riapro:", todayId);
-    const nowIso = market.opened_at || new Date().toISOString();
-    const { data, error } = await supabase
+    const openedAt = new Date().toISOString();
+    const { data, error: insErr } = await supabase
       .from("markets")
-      .update({
+      .insert({
+        id: marketId,
+        underlying: "TSLA",
+        date: dateStr,
         status: "OPEN",
-        opened_at: nowIso,
+        up_pool: 0,
+        down_pool: 0,
+        opened_at: openedAt,
       })
-      .eq("id", todayId)
       .select()
       .single();
-    if (error) throw error;
+    if (insErr) throw insErr;
     market = data;
+  } else if (error && error.code !== "PGRST116") {
+    throw error;
   }
 
   return market;
 }
 
-// Chiude hard il mercato di ieri se è ancora OPEN
-async function hardLockYesterdayMarket() {
-  const yesterdayId = getYesterdayMarketId();
-  const market = await getMarketById(yesterdayId);
-
-  if (!market) {
-    console.log("[CRON] Nessun market da chiudere per ieri:", yesterdayId);
-    return { locked: false, reason: "no_market" };
-  }
-
-  if (market.status !== "OPEN") {
-    console.log(
-      "[CRON] Market di ieri esiste ma non è OPEN, stato attuale:",
-      market.status
-    );
-    return { locked: false, reason: "not_open", status: market.status };
-  }
-
-  const nowIso = new Date().toISOString();
-  const { error } = await supabase
+/**
+ * Ritorna il mercato di oggi, se esiste (senza crearlo).
+ */
+async function getTodayMarketIfExists() {
+  const { id: marketId } = getMarketIdForTodayRome();
+  const { data: market, error } = await supabase
     .from("markets")
-    .update({
-      status: "LOCKED",
-      locked_at: nowIso,
-    })
-    .eq("id", yesterdayId);
-
+    .select("*")
+    .eq("id", marketId)
+    .single();
+  if (error && error.code === "PGRST116") return null;
   if (error) throw error;
-
-  console.log("[CRON] Market di ieri LOCKED:", yesterdayId);
-  return { locked: true, id: yesterdayId };
+  return market;
 }
 
-// ---------- UTENTI / BETS ----------
-
-async function getOrCreateUser(from) {
-  const { id, username, first_name } = from;
-  await supabase
-    .from("users")
-    .upsert({ id, username, first_name }, { onConflict: "id" });
-  return id;
+/**
+ * Calcola da quanto tempo il mercato è aperto (in minuti) a partire da opened_at.
+ */
+function getMinutesSinceOpened(market) {
+  if (!market.opened_at) return null;
+  const opened = new Date(market.opened_at);
+  const diffMs = Date.now() - opened.getTime();
+  return Math.floor(diffMs / 60000);
 }
 
 // ---------- BOT EVENTS ----------
-
 bot.on("polling_error", (err) => console.error("Polling error:", err));
 
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
+  try {
+    // opzionale: assicuriamo che il mercato di oggi esista
+    await getOrCreateTodayMarket();
+  } catch (e) {
+    console.error("Error ensuring today market on /start:", e);
+  }
+
   bot.sendMessage(
     msg.chat.id,
     "⚡ Welcome to Healyum!\nPredict Tesla: will it go UP or DOWN?",
@@ -202,22 +170,21 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/status/, async (msg) => {
   try {
-    const todayId = getTodayMarketId();
-    const market = await getMarketById(
-      todayId,
-      "id,status,up_pool,down_pool,opened_at,locked_at"
-    );
-
+    const market = await getTodayMarketIfExists();
     if (!market) {
       return bot.sendMessage(
         msg.chat.id,
-        `No market yet for today (${todayId}).`
+        "No market for today yet. It will open automatically at the US market open."
       );
     }
 
+    const minutesOpen = getMinutesSinceOpened(market);
+    const ageText =
+      minutesOpen != null ? `Open since ${minutesOpen} minutes.` : "Opened_at not set.";
+
     bot.sendMessage(
       msg.chat.id,
-      `📊 Market ${market.id}\nStatus: ${market.status}\nUP pool: ${market.up_pool}\nDOWN pool: ${market.down_pool}\nOpened at: ${market.opened_at || "n/a"}`
+      `📊 Market ${market.id}\nStatus: ${market.status}\nUP pool: ${market.up_pool}\nDOWN pool: ${market.down_pool}\n${ageText}`
     );
   } catch (e) {
     console.error(e);
@@ -238,7 +205,6 @@ bot.on("message", async (msg) => {
 });
 
 // ---------- WEBAPP HANDLER ----------
-
 async function handleWebAppData(msg) {
   try {
     const payload = JSON.parse(msg.web_app_data.data);
@@ -251,7 +217,7 @@ async function handleWebAppData(msg) {
     const stake = Number(payload.stake || 1);
 
     const userId = await getOrCreateUser(msg.from);
-    const market = await getOrCreateTodayOpenMarket();
+    const market = await getOrCreateTodayMarket();
 
     if (market.status !== "OPEN") {
       return bot.sendMessage(
@@ -285,36 +251,51 @@ async function handleWebAppData(msg) {
   }
 }
 
-// ---------- RESOLUTION LOGIC (manuale via /resolve_up /resolve_down) ----------
+// ---------- USER & RESOLUTION LOGIC ----------
+async function getOrCreateUser(from) {
+  const { id, username, first_name } = from;
+  await supabase
+    .from("users")
+    .upsert({ id, username, first_name }, { onConflict: "id" });
+  return id;
+}
 
 async function resolveTodayMarket(chatId, winningSide) {
-  const todayId = getTodayMarketId();
-
-  const market = await getMarketById(todayId);
+  const market = await getTodayMarketIfExists();
   if (!market) {
-    return bot.sendMessage(chatId, `No market for today (${todayId}).`);
+    return bot.sendMessage(chatId, "No market for today.");
   }
 
-  const { data: bets, error: betsErr } = await supabase
+  const { data: bets } = await supabase
     .from("bets")
     .select("*")
-    .eq("market_id", todayId);
-
-  if (betsErr) {
-    console.error(betsErr);
-    return bot.sendMessage(chatId, "❌ Error reading bets.");
-  }
+    .eq("market_id", market.id);
 
   const upPool = market.up_pool;
   const downPool = market.down_pool;
   const totalPool = upPool + downPool;
   const winnersPool = winningSide === "UP" ? upPool : downPool;
 
-  const distributable = totalPool * (1 - FEE);
-  const multiplier = winnersPool > 0 ? distributable / winnersPool : 0;
+  if (!winnersPool || winnersPool <= 0) {
+    await supabase
+      .from("markets")
+      .update({
+        status: "RESOLVED",
+        resolved_at: new Date().toISOString(),
+      })
+      .eq("id", market.id);
 
-  for (const bet of bets) {
-    if (bet.side === winningSide && winnersPool > 0) {
+    return bot.sendMessage(
+      chatId,
+      `Market ${market.id} resolved with no winners on ${winningSide}.`
+    );
+  }
+
+  const distributable = totalPool * (1 - FEE);
+  const multiplier = distributable / winnersPool;
+
+  for (const bet of bets || []) {
+    if (bet.side === winningSide) {
       const payout = bet.stake * multiplier;
       await supabase
         .from("bets")
@@ -322,73 +303,84 @@ async function resolveTodayMarket(chatId, winningSide) {
         .eq("id", bet.id);
       bot.sendMessage(
         bet.user_id,
-        `🎉 You WON on ${todayId}! Payout: ${payout.toFixed(2)}`
+        `🎉 You WON on ${market.id}! Payout: ${payout.toFixed(2)}`
       );
     }
   }
 
-  const nowIso = new Date().toISOString();
-  const { error: updErr } = await supabase
+  await supabase
     .from("markets")
-    .update({ status: "RESOLVED", resolved_at: nowIso })
-    .eq("id", todayId);
+    .update({ status: "RESOLVED", resolved_at: new Date().toISOString() })
+    .eq("id", market.id);
 
-  if (updErr) {
-    console.error(updErr);
-    return bot.sendMessage(chatId, "❌ Error updating market status.");
-  }
-
-  bot.sendMessage(chatId, `Market ${todayId} resolved as ${winningSide}.`);
+  bot.sendMessage(chatId, `Market ${market.id} resolved.`);
 }
 
-// ---------- EXPRESS API ----------
-
-// Healthcheck
-app.get("/", (_, res) => res.send("Healyum bot running 🟢"));
-
-// Usato dalla mini-app per leggere il market corrente
-app.get("/market/today", async (_, res) => {
+// ---------- CRON ROUTE (OPZIONE B: chiamata da Google Cron) ----------
+app.get("/cron/daily", async (req, res) => {
   try {
-    const todayId = getTodayMarketId();
-    const market = await getMarketById(
-      todayId,
-      "id,status,up_pool,down_pool,opened_at"
-    );
-
-    if (!market) {
-      return res.status(404).json({ error: "no market" });
+    const secret = req.query.secret;
+    if (!CRON_SECRET || secret !== CRON_SECRET) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
     }
 
-    res.json(market);
+    const lockTimeUtc = getTodayLockTimeUtc();
+    const now = nowUtc();
+
+    let market = await getTodayMarketIfExists();
+
+    // 1) Se non c'è ancora un mercato per oggi, crealo e aprilo
+    if (!market) {
+      market = await getOrCreateTodayMarket();
+      console.log("Cron: created market", market.id);
+      return res.json({ ok: true, action: "created", marketId: market.id });
+    }
+
+    // 2) Se esiste ed è OPEN e siamo oltre l'ora di lock -> LOCKED
+    if (market.status === "OPEN" && now >= lockTimeUtc) {
+      await supabase
+        .from("markets")
+        .update({ status: "LOCKED", locked_at: new Date().toISOString() })
+        .eq("id", market.id);
+
+      console.log("Cron: locked market", market.id);
+      return res.json({ ok: true, action: "locked", marketId: market.id });
+    }
+
+    // 3) Altrimenti non fa nulla
+    return res.json({
+      ok: true,
+      action: "none",
+      marketId: market.id,
+      status: market.status,
+    });
   } catch (e) {
-    console.error("Error /market/today:", e);
-    res.status(500).json({ error: "server_error" });
+    console.error("Error in /cron/daily:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// ---------- CRON GIORNALIERO ----------
-// Da chiamare una volta al giorno alle 15:30 (ora di Roma) con:
-// POST https://healyum-bot.onrender.com/cron/daily?secret=TUO_CRON_SECRET
-app.post("/cron/daily", async (req, res) => {
-  if (req.query.secret !== CRON_SECRET) {
-    return res.status(403).json({ error: "forbidden" });
-  }
+// ---------- EXPRESS API ----------
+app.get("/", (_, res) => res.send("Healyum bot running 🟢"));
 
+app.get("/market/today", async (_, res) => {
   try {
-    // 1) chiudi (LOCKED) il mercato di ieri se era ancora OPEN
-    const lockResult = await hardLockYesterdayMarket();
+    const market = await getTodayMarketIfExists();
+    if (!market) return res.status(404).json({ error: "no market" });
 
-    // 2) apri/assicurati OPEN il mercato di oggi
-    const todayMarket = await getOrCreateTodayOpenMarket();
-
+    const minutesOpen = getMinutesSinceOpened(market);
     res.json({
-      ok: true,
-      lock: lockResult,
-      todayMarketId: todayMarket.id,
-      todayStatus: todayMarket.status,
+      id: market.id,
+      status: market.status,
+      up_pool: market.up_pool,
+      down_pool: market.down_pool,
+      opened_at: market.opened_at,
+      locked_at: market.locked_at,
+      resolved_at: market.resolved_at,
+      minutes_open: minutesOpen,
     });
   } catch (e) {
-    console.error("Error /cron/daily:", e);
+    console.error("Error in /market/today:", e);
     res.status(500).json({ error: "server_error" });
   }
 });
