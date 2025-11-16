@@ -35,10 +35,6 @@ app.use(express.json());
 const WEB_APP_URL = "https://healyum-miniapp.vercel.app/";
 const FEE = 0.02;
 
-// Orario di “cambio giorno” del pool in Europe/Rome
-const LOCK_HOUR = 15;
-const LOCK_MINUTE = 30;
-
 // ---------- UTILS ----------
 
 /**
@@ -70,30 +66,6 @@ function getMarketIdForRomeDate(date = new Date()) {
 }
 
 /**
- * Identifica il **mercato attivo in questo momento**.
- *
- * Regola:
- *  - prima delle 15:30 Europe/Rome → mercato del GIORNO PRIMA
- *  - dalle 15:30 in poi → mercato del GIORNO CORRENTE
- */
-function getActiveMarketIdRome(now = new Date()) {
-  const romeNow = getRomeNow(now);
-  const h = romeNow.getHours();
-  const m = romeNow.getMinutes();
-
-  const beforeLock = h < LOCK_HOUR || (h === LOCK_HOUR && m < LOCK_MINUTE);
-  const effectiveDate = new Date(romeNow);
-
-  if (beforeLock) {
-    // prima delle 15:30 → il pool "attivo" è quello di ieri
-    effectiveDate.setDate(effectiveDate.getDate() - 1);
-  }
-  // altrimenti (dalle 15:30 in poi) → use today
-
-  return getMarketIdForRomeDate(effectiveDate);
-}
-
-/**
  * Calcola da quanto tempo il mercato è aperto (in minuti) a partire da opened_at.
  */
 function getMinutesSinceOpened(market) {
@@ -104,55 +76,48 @@ function getMinutesSinceOpened(market) {
 }
 
 /**
- * Crea o ritorna il **mercato attivo** in questo momento.
- * (Se è la prima volta che lo usi per quella giornata, lo crea)
+ * Restituisce il market OPEN più recente, se esiste.
  */
-async function getOrCreateActiveMarket() {
-  const { id: marketId, dateStr } = getActiveMarketIdRome();
-
-  let { data: market, error } = await supabase
+async function getActiveMarketIfExists() {
+  const { data, error } = await supabase
     .from("markets")
     .select("*")
-    .eq("id", marketId)
-    .single();
+    .eq("status", "OPEN")
+    .order("date", { ascending: false })
+    .limit(1);
 
-  if (!market) {
-    const openedAt = new Date().toISOString();
-    const { data, error: insErr } = await supabase
-      .from("markets")
-      .insert({
-        id: marketId,
-        underlying: "TSLA",
-        date: dateStr,
-        status: "OPEN",
-        up_pool: 0,
-        down_pool: 0,
-        opened_at: openedAt,
-      })
-      .select()
-      .single();
-    if (insErr) throw insErr;
-    market = data;
-  } else if (error && error.code !== "PGRST116") {
-    throw error;
-  }
-
-  return market;
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
 }
 
 /**
- * Ritorna il **mercato attivo**, se esiste (senza crearlo).
+ * Ritorna il market OPEN più recente,
+ * se non esiste ne crea uno nuovo per la data di oggi (Europe/Rome).
  */
-async function getActiveMarketIfExists() {
-  const { id: marketId } = getActiveMarketIdRome();
-  const { data: market, error } = await supabase
+async function getOrCreateActiveMarket() {
+  const existing = await getActiveMarketIfExists();
+  if (existing) return existing;
+
+  const romeNow = getRomeNow();
+  const { id: marketId, dateStr } = getMarketIdForRomeDate(romeNow);
+  const openedAt = new Date().toISOString();
+
+  const { data, error } = await supabase
     .from("markets")
-    .select("*")
-    .eq("id", marketId)
+    .insert({
+      id: marketId,
+      underlying: "TSLA",
+      date: dateStr,
+      status: "OPEN",
+      up_pool: 0,
+      down_pool: 0,
+      opened_at: openedAt,
+    })
+    .select()
     .single();
-  if (error && error.code === "PGRST116") return null;
+
   if (error) throw error;
-  return market;
+  return data;
 }
 
 /**
@@ -328,7 +293,7 @@ async function handleWebAppData(msg) {
     const stake = Number(payload.stake || 1);
 
     const userId = await getOrCreateUser(msg.from);
-    const market = await getOrCreateActiveMarket();
+    const market = await getOrCreateActiveMarket(); // <-- ora usa SEMPRE l'ultimo OPEN
 
     if (market.status !== "OPEN") {
       return bot.sendMessage(
@@ -346,8 +311,13 @@ async function handleWebAppData(msg) {
     });
 
     // aggiorna i pool (approccio semplice, va bene per MVP)
-    const newUpPool = market.up_pool + (side === "UP" ? stake : 0);
-    const newDownPool = market.down_pool + (side === "DOWN" ? stake : 0);
+    const newUpPool = (Number(market.up_pool) || 0) + (side === "UP" ? stake : 0);
+    const newDownPool =
+      (Number(market.down_pool) || 0) + (side === "DOWN" ? stake : 0);
+
+    // aggiorno anche l'oggetto in memoria per risposta testuale
+    market.up_pool = newUpPool;
+    market.down_pool = newDownPool;
 
     await supabase
       .from("markets")
@@ -388,8 +358,8 @@ async function resolveTodayMarket(chatId, winningSide) {
     .select("*")
     .eq("market_id", market.id);
 
-  const upPool = market.up_pool;
-  const downPool = market.down_pool;
+  const upPool = Number(market.up_pool) || 0;
+  const downPool = Number(market.down_pool) || 0;
   const totalPool = upPool + downPool;
   const winnersPool = winningSide === "UP" ? upPool : downPool;
 
@@ -569,13 +539,12 @@ app.get("/api/markets/latest", async (req, res) => {
       pct_down,
       total_votes: totalVotes,
       volume_usdc: volumeUsdc,
-      // per ora non gestiamo prezzi/URL reali → null
       open_price: null,
       current_price: null,
       wallet_url: null,
     });
   } catch (e) {
-    console.error("Error in /api/markets/latest:", e);
+    console.error("Error in /api/markets/latest", e);
     res.status(500).json({ error: "server_error" });
   }
 });
@@ -592,7 +561,6 @@ app.get("/api/markets/:id/history", async (req, res) => {
     const { bets, totalVotes, volumeUsdc } = await getVotesAndVolume(marketId);
     let history = buildHistoryFromBets(bets);
 
-    // filtro per range temporale (dal client: 1h, 6h, all)
     if (range === "1h" || range === "6h") {
       const hours = range === "1h" ? 1 : 6;
       const cutoff = new Date();
@@ -608,7 +576,7 @@ app.get("/api/markets/:id/history", async (req, res) => {
       history,
     });
   } catch (e) {
-    console.error("Error in /api/markets/:id/history:", e);
+    console.error("Error in /api/markets/:id/history", e);
     res.status(500).json({ error: "server_error" });
   }
 });
