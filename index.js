@@ -39,6 +39,10 @@ const WEB_APP_URL = "https://healyum-miniapp.vercel.app/";
 const FEE = 0.02;
 const STOCK_SYMBOL = "TSLA"; // stock reale
 
+// limiti stake lato backend (devono matchare la miniapp)
+const MIN_STAKE = 1;
+const MAX_STAKE = 50;
+
 // ---------- TIMEZONE UTILS (Europe/Rome) ----------
 
 /**
@@ -257,7 +261,6 @@ bot.on("polling_error", (err) => console.error("Polling error:", err));
 
 bot.onText(/\/start/, async (msg) => {
   try {
-    // opzionale: assicuriamo che il mercato attivo esista
     await getOrCreateActiveMarket();
   } catch (e) {
     console.error("Error ensuring active market on /start:", e);
@@ -331,7 +334,12 @@ async function handleWebAppData(msg) {
 
     const rawSide = payload.side;
     const side = rawSide === "TESLA_UP" ? "UP" : "DOWN";
-    const stake = Number(payload.stake || 1);
+
+    // stake dalla miniapp + clamp 1–50
+    let stake = Number(payload.stake);
+    if (!Number.isFinite(stake)) stake = MIN_STAKE;
+    if (stake < MIN_STAKE) stake = MIN_STAKE;
+    if (stake > MAX_STAKE) stake = MAX_STAKE;
 
     const userId = await getOrCreateUser(msg.from);
     const market = await getOrCreateActiveMarket();
@@ -365,7 +373,7 @@ async function handleWebAppData(msg) {
 
     bot.sendMessage(
       msg.chat.id,
-      `Got it ✅ You chose ${side} with stake ${stake} on ${market.id}\nCurrent pool → UP: ${newUpPool} | DOWN: ${newDownPool}`
+      `Got it ✅ You chose ${side} with stake ${stake} USDC on ${market.id}\nCurrent pool → UP: ${newUpPool} | DOWN: ${newDownPool}`
     );
   } catch (e) {
     console.error("Error in handleWebAppData", e);
