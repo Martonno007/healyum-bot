@@ -43,7 +43,6 @@ const LOCK_MINUTE = 30;
 
 /**
  * Restituisce un oggetto Date che rappresenta "ora" nel fuso Europe/Rome.
- * (Stesso momento, ma con orario locale di Roma)
  */
 function getRomeNow(baseDate = new Date()) {
   return new Date(
@@ -52,7 +51,7 @@ function getRomeNow(baseDate = new Date()) {
 }
 
 /**
- * Restituisce "YYYY-MM-DD" calcolato nel fuso Europe/Rome
+ * Restituisce "YYYY-MM-DD" calcolato nel fuso Europe/Rome.
  */
 function getRomeDateStr(date = new Date()) {
   const rome = getRomeNow(date);
@@ -82,9 +81,7 @@ function getActiveMarketIdRome(now = new Date()) {
   const h = romeNow.getHours();
   const m = romeNow.getMinutes();
 
-  const beforeLock =
-    h < LOCK_HOUR || (h === LOCK_HOUR && m < LOCK_MINUTE);
-
+  const beforeLock = h < LOCK_HOUR || (h === LOCK_HOUR && m < LOCK_MINUTE);
   const effectiveDate = new Date(romeNow);
 
   if (beforeLock) {
@@ -94,6 +91,16 @@ function getActiveMarketIdRome(now = new Date()) {
   // altrimenti (dalle 15:30 in poi) → use today
 
   return getMarketIdForRomeDate(effectiveDate);
+}
+
+/**
+ * Calcola da quanto tempo il mercato è aperto (in minuti) a partire da opened_at.
+ */
+function getMinutesSinceOpened(market) {
+  if (!market.opened_at) return null;
+  const opened = new Date(market.opened_at);
+  const diffMs = Date.now() - opened.getTime();
+  return Math.floor(diffMs / 60000);
 }
 
 /**
@@ -149,13 +156,94 @@ async function getActiveMarketIfExists() {
 }
 
 /**
- * Calcola da quanto tempo il mercato è aperto (in minuti) a partire da opened_at.
+ * Ritorna il market "più recente":
+ *  1) se esiste un OPEN prende quello
+ *  2) altrimenti prende comunque l'ultimo per data (LOCKED/RESOLVED)
  */
-function getMinutesSinceOpened(market) {
-  if (!market.opened_at) return null;
-  const opened = new Date(market.opened_at);
-  const diffMs = Date.now() - opened.getTime();
-  return Math.floor(diffMs / 60000);
+async function getLatestMarket() {
+  // prima provo un OPEN
+  let { data: openMarkets, error } = await supabase
+    .from("markets")
+    .select("*")
+    .eq("status", "OPEN")
+    .order("date", { ascending: false })
+    .limit(1);
+
+  if (error) throw error;
+
+  let market = openMarkets && openMarkets[0];
+
+  if (!market) {
+    // nessun OPEN → prendo l'ultimo per data
+    const { data: anyMarkets, error: anyErr } = await supabase
+      .from("markets")
+      .select("*")
+      .order("date", { ascending: false })
+      .limit(1);
+
+    if (anyErr) throw anyErr;
+    market = anyMarkets && anyMarkets[0];
+  }
+
+  return market || null;
+}
+
+/**
+ * Calcola #voti e volume USDC da tabella bets per un dato mercato.
+ */
+async function getVotesAndVolume(marketId) {
+  const { data: bets, error } = await supabase
+    .from("bets")
+    .select("side, stake, created_at")
+    .eq("market_id", marketId)
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+
+  const totalVotes = bets.length;
+  const volumeUsdc = bets.reduce(
+    (sum, b) => sum + (Number(b.stake) || 0),
+    0
+  );
+
+  return { bets, totalVotes, volumeUsdc };
+}
+
+/**
+ * Costruisce lo storico per il grafico:
+ * punti cumulativi nel tempo con pct_up/pct_down, total_votes, volume_usdc.
+ */
+function buildHistoryFromBets(bets) {
+  const history = [];
+  let upPool = 0;
+  let downPool = 0;
+  let votes = 0;
+  let volume = 0;
+
+  for (const b of bets) {
+    const stake = Number(b.stake) || 0;
+    if (b.side === "UP") {
+      upPool += stake;
+    } else if (b.side === "DOWN") {
+      downPool += stake;
+    }
+    votes += 1;
+    volume += stake;
+
+    const total = upPool + downPool;
+    const pct_up = total === 0 ? 0.5 : upPool / total;
+    const pct_down = 1 - pct_up;
+
+    history.push({
+      ts: b.created_at,
+      pct_up,
+      pct_down,
+      total_votes: votes,
+      volume_usdc: volume,
+    });
+  }
+
+  return history;
 }
 
 // ---------- BOT EVENTS ----------
@@ -249,6 +337,7 @@ async function handleWebAppData(msg) {
       );
     }
 
+    // salva la bet
     await supabase.from("bets").insert({
       user_id: userId,
       market_id: market.id,
@@ -256,6 +345,7 @@ async function handleWebAppData(msg) {
       stake,
     });
 
+    // aggiorna i pool (approccio semplice, va bene per MVP)
     const newUpPool = market.up_pool + (side === "UP" ? stake : 0);
     const newDownPool = market.down_pool + (side === "DOWN" ? stake : 0);
 
@@ -421,11 +511,15 @@ app.get("/cron/daily", async (req, res) => {
 });
 
 // ---------- EXPRESS API ----------
+
+// healthcheck
 app.get("/", (_, res) => res.send("Healyum bot running 🟢"));
 
+/**
+ * API vecchia usata da /status
+ */
 app.get("/market/today", async (_, res) => {
   try {
-    // Qui "today" = mercato attivo secondo la regola delle 15:30
     const market = await getActiveMarketIfExists();
     if (!market) return res.status(404).json({ error: "no_market" });
 
@@ -442,6 +536,79 @@ app.get("/market/today", async (_, res) => {
     });
   } catch (e) {
     console.error("Error in /market/today:", e);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+/**
+ * Nuova API per la mini-app: ultimo market (OPEN se possibile).
+ * Restituisce percentuali (0-1), numero voti e volume usdc.
+ */
+app.get("/api/markets/latest", async (req, res) => {
+  try {
+    const market = await getLatestMarket();
+    if (!market) {
+      return res.status(404).json({ error: "no_market" });
+    }
+
+    const up = Number(market.up_pool) || 0;
+    const down = Number(market.down_pool) || 0;
+    const totalShares = up + down;
+    const pct_up = totalShares === 0 ? 0.5 : up / totalShares;
+    const pct_down = 1 - pct_up;
+
+    const { totalVotes, volumeUsdc } = await getVotesAndVolume(market.id);
+
+    res.json({
+      id: market.id,
+      asset: (market.underlying || "TSLA") + "X",
+      date: market.date,
+      status: market.status,
+      opened_at: market.opened_at,
+      pct_up,
+      pct_down,
+      total_votes: totalVotes,
+      volume_usdc: volumeUsdc,
+      // per ora non gestiamo prezzi/URL reali → null
+      open_price: null,
+      current_price: null,
+      wallet_url: null,
+    });
+  } catch (e) {
+    console.error("Error in /api/markets/latest:", e);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+/**
+ * Storico per grafico: /api/markets/:id/history?range=1h|6h|all
+ * Ricostruito dai bets ordinati per created_at.
+ */
+app.get("/api/markets/:id/history", async (req, res) => {
+  try {
+    const marketId = req.params.id;
+    const range = req.query.range || "all";
+
+    const { bets, totalVotes, volumeUsdc } = await getVotesAndVolume(marketId);
+    let history = buildHistoryFromBets(bets);
+
+    // filtro per range temporale (dal client: 1h, 6h, all)
+    if (range === "1h" || range === "6h") {
+      const hours = range === "1h" ? 1 : 6;
+      const cutoff = new Date();
+      cutoff.setHours(cutoff.getHours() - hours);
+      const cutoffMs = cutoff.getTime();
+      history = history.filter((p) => new Date(p.ts).getTime() >= cutoffMs);
+    }
+
+    res.json({
+      market_id: marketId,
+      total_votes: totalVotes,
+      volume_usdc: volumeUsdc,
+      history,
+    });
+  } catch (e) {
+    console.error("Error in /api/markets/:id/history:", e);
     res.status(500).json({ error: "server_error" });
   }
 });
