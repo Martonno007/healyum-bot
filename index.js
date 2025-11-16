@@ -4,8 +4,8 @@ const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
 const cors = require("cors");
 
-// In Node 18+ fetch è globale. Se usi una versione più vecchia su Render,
-// installa "node-fetch" e importa fetch manualmente.
+// In Node 18+ fetch è globale. Se su Render usi Node <18,
+// installa "node-fetch" e fai: const fetch = require("node-fetch");
 
 // ---------- ENV ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -37,11 +37,9 @@ app.use(express.json());
 // ---------- COSTANTI ----------
 const WEB_APP_URL = "https://healyum-miniapp.vercel.app/";
 const FEE = 0.02;
+const STOCK_SYMBOL = "TSLA"; // stock reale
 
-// simbolo stock reale (Tesla)
-const STOCK_SYMBOL = "TSLA";
-
-// ---------- UTILS BASE TIMEZONE ----------
+// ---------- TIMEZONE UTILS (Europe/Rome) ----------
 
 /**
  * Restituisce un oggetto Date che rappresenta "ora" nel fuso Europe/Rome.
@@ -85,7 +83,6 @@ function getMinutesSinceOpened(market) {
 
 /**
  * Legge il prezzo corrente di TSLA da Yahoo Finance.
- * Usa l'endpoint pubblico chart.
  */
 async function fetchStockPrice() {
   try {
@@ -155,7 +152,7 @@ async function getOrCreateActiveMarket() {
       down_pool: 0,
       opened_at: openedAt,
       open_price: openPrice,
-      last_price: openPrice,
+      current_price: openPrice,
     })
     .select()
     .single();
@@ -442,7 +439,7 @@ async function resolveTodayMarket(chatId, winningSide) {
   bot.sendMessage(chatId, `Market ${market.id} resolved.`);
 }
 
-// ---------- CRON ROUTE (una volta al giorno, ES: 00:00 Europe/Rome) ----------
+// ---------- CRON ROUTE (una volta al giorno, es. 00:00 Europe/Rome) ----------
 app.get("/cron/daily", async (req, res) => {
   try {
     if (req.query.secret !== CRON_SECRET) {
@@ -506,7 +503,7 @@ app.get("/cron/daily", async (req, res) => {
         down_pool: 0,
         opened_at: now.toISOString(),
         open_price: openPrice,
-        last_price: openPrice,
+        current_price: openPrice,
       });
 
       createdToday = true;
@@ -580,14 +577,26 @@ app.get("/api/markets/latest", async (_, res) => {
 
     const { totalVotes, volumeUsdc } = await getVotesAndVolume(market.id);
 
-    // prezzo live TSLA
+    // 1) prezzo live TSLA
     const livePrice = await fetchStockPrice();
+    let currentPrice = market.current_price;
+
     if (livePrice !== null) {
+      currentPrice = livePrice;
       await supabase
         .from("markets")
-        .update({ last_price: livePrice })
+        .update({ current_price: livePrice })
         .eq("id", market.id);
-      market.last_price = livePrice;
+      market.current_price = livePrice;
+    }
+
+    // 2) se open_price è ancora null (vecchi mercati), inizializzalo
+    if (market.open_price == null && currentPrice != null) {
+      await supabase
+        .from("markets")
+        .update({ open_price: currentPrice })
+        .eq("id", market.id);
+      market.open_price = currentPrice;
     }
 
     res.json({
@@ -601,8 +610,8 @@ app.get("/api/markets/latest", async (_, res) => {
       total_votes: totalVotes,
       volume_usdc: volumeUsdc,
       open_price: market.open_price ?? null,
-      current_price: livePrice,
-      wallet_url: null, // se un giorno vuoi linkare TSLAx nel wallet
+      current_price: currentPrice,
+      wallet_url: null, // in futuro link alla TSLAx del wallet
     });
   } catch (e) {
     console.error("Error in /api/markets/latest", e);
