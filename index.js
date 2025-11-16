@@ -4,6 +4,9 @@ const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
 const cors = require("cors");
 
+// In Node 18+ fetch è globale. Se usi una versione più vecchia su Render,
+// installa "node-fetch" e importa fetch manualmente.
+
 // ---------- ENV ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -35,7 +38,10 @@ app.use(express.json());
 const WEB_APP_URL = "https://healyum-miniapp.vercel.app/";
 const FEE = 0.02;
 
-// ---------- UTILS ----------
+// simbolo stock reale (Tesla)
+const STOCK_SYMBOL = "TSLA";
+
+// ---------- UTILS BASE TIMEZONE ----------
 
 /**
  * Restituisce un oggetto Date che rappresenta "ora" nel fuso Europe/Rome.
@@ -75,6 +81,39 @@ function getMinutesSinceOpened(market) {
   return Math.floor(diffMs / 60000);
 }
 
+// ---------- UTIL STOCK PRICE (TSLA REALE) ----------
+
+/**
+ * Legge il prezzo corrente di TSLA da Yahoo Finance.
+ * Usa l'endpoint pubblico chart.
+ */
+async function fetchStockPrice() {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${STOCK_SYMBOL}?interval=1m&range=1d`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error("TSLA price HTTP error:", res.status, res.statusText);
+      return null;
+    }
+
+    const json = await res.json();
+    const result = json?.chart?.result?.[0];
+    const price = result?.meta?.regularMarketPrice;
+
+    if (typeof price !== "number") {
+      console.error("TSLA price not found in Yahoo response");
+      return null;
+    }
+
+    return price; // prezzo in USD
+  } catch (e) {
+    console.error("TSLA price fetch error:", e);
+    return null;
+  }
+}
+
+// ---------- MARKET HELPERS ----------
+
 /**
  * Restituisce il market OPEN più recente, se esiste.
  */
@@ -93,6 +132,7 @@ async function getActiveMarketIfExists() {
 /**
  * Ritorna il market OPEN più recente,
  * se non esiste ne crea uno nuovo per la data di oggi (Europe/Rome).
+ * Quando lo crea, salva anche il prezzo di apertura TSLA (open_price).
  */
 async function getOrCreateActiveMarket() {
   const existing = await getActiveMarketIfExists();
@@ -101,6 +141,8 @@ async function getOrCreateActiveMarket() {
   const romeNow = getRomeNow();
   const { id: marketId, dateStr } = getMarketIdForRomeDate(romeNow);
   const openedAt = new Date().toISOString();
+
+  const openPrice = await fetchStockPrice();
 
   const { data, error } = await supabase
     .from("markets")
@@ -112,6 +154,8 @@ async function getOrCreateActiveMarket() {
       up_pool: 0,
       down_pool: 0,
       opened_at: openedAt,
+      open_price: openPrice,
+      last_price: openPrice,
     })
     .select()
     .single();
@@ -248,7 +292,7 @@ bot.onText(/\/status/, async (msg) => {
     if (!market) {
       return bot.sendMessage(
         msg.chat.id,
-        "No active market yet. It will open automatically at the US market open."
+        "No active market yet. It will open automatically."
       );
     }
 
@@ -293,7 +337,7 @@ async function handleWebAppData(msg) {
     const stake = Number(payload.stake || 1);
 
     const userId = await getOrCreateUser(msg.from);
-    const market = await getOrCreateActiveMarket(); // <-- ora usa SEMPRE l'ultimo OPEN
+    const market = await getOrCreateActiveMarket();
 
     if (market.status !== "OPEN") {
       return bot.sendMessage(
@@ -302,7 +346,6 @@ async function handleWebAppData(msg) {
       );
     }
 
-    // salva la bet
     await supabase.from("bets").insert({
       user_id: userId,
       market_id: market.id,
@@ -310,12 +353,11 @@ async function handleWebAppData(msg) {
       stake,
     });
 
-    // aggiorna i pool (approccio semplice, va bene per MVP)
-    const newUpPool = (Number(market.up_pool) || 0) + (side === "UP" ? stake : 0);
+    const newUpPool =
+      (Number(market.up_pool) || 0) + (side === "UP" ? stake : 0);
     const newDownPool =
       (Number(market.down_pool) || 0) + (side === "DOWN" ? stake : 0);
 
-    // aggiorno anche l'oggetto in memoria per risposta testuale
     market.up_pool = newUpPool;
     market.down_pool = newDownPool;
 
@@ -400,7 +442,7 @@ async function resolveTodayMarket(chatId, winningSide) {
   bot.sendMessage(chatId, `Market ${market.id} resolved.`);
 }
 
-// ---------- CRON ROUTE (chiamata una volta al giorno alle 15:30 Europe/Rome) ----------
+// ---------- CRON ROUTE (una volta al giorno, ES: 00:00 Europe/Rome) ----------
 app.get("/cron/daily", async (req, res) => {
   try {
     if (req.query.secret !== CRON_SECRET) {
@@ -410,7 +452,7 @@ app.get("/cron/daily", async (req, res) => {
     const now = new Date();
     const romeNow = getRomeNow(now);
 
-    // Mercato che sta FINENDO (pool precedente, aperto ieri alle 15:30)
+    // Mercato che sta FINENDO (pool precedente)
     const yesterdayRome = new Date(romeNow);
     yesterdayRome.setDate(yesterdayRome.getDate() - 1);
     const yesterdayInfo = getMarketIdForRomeDate(yesterdayRome);
@@ -443,7 +485,7 @@ app.get("/cron/daily", async (req, res) => {
       console.log("Locked yesterday’s market:", marketIdYesterday);
     }
 
-    // 2️⃣ CREA SEMPRE il nuovo mercato OGGI (apertura nuovo pool alle 15:30)
+    // 2️⃣ CREA SEMPRE il nuovo mercato OGGI (nuovo pool giornaliero)
     const { data: existingToday } = await supabase
       .from("markets")
       .select("*")
@@ -453,6 +495,8 @@ app.get("/cron/daily", async (req, res) => {
     let createdToday = false;
 
     if (!existingToday) {
+      const openPrice = await fetchStockPrice();
+
       await supabase.from("markets").insert({
         id: marketIdToday,
         underlying: "TSLA",
@@ -461,10 +505,17 @@ app.get("/cron/daily", async (req, res) => {
         up_pool: 0,
         down_pool: 0,
         opened_at: now.toISOString(),
+        open_price: openPrice,
+        last_price: openPrice,
       });
 
       createdToday = true;
-      console.log("Created today’s market:", marketIdToday);
+      console.log(
+        "Created today’s market:",
+        marketIdToday,
+        "open_price=",
+        openPrice
+      );
     }
 
     return res.json({
@@ -512,9 +563,9 @@ app.get("/market/today", async (_, res) => {
 
 /**
  * Nuova API per la mini-app: ultimo market (OPEN se possibile).
- * Restituisce percentuali (0-1), numero voti e volume usdc.
+ * Restituisce percentuali (0-1), numero voti, volume usdc e prezzi TSLA.
  */
-app.get("/api/markets/latest", async (req, res) => {
+app.get("/api/markets/latest", async (_, res) => {
   try {
     const market = await getLatestMarket();
     if (!market) {
@@ -529,9 +580,19 @@ app.get("/api/markets/latest", async (req, res) => {
 
     const { totalVotes, volumeUsdc } = await getVotesAndVolume(market.id);
 
+    // prezzo live TSLA
+    const livePrice = await fetchStockPrice();
+    if (livePrice !== null) {
+      await supabase
+        .from("markets")
+        .update({ last_price: livePrice })
+        .eq("id", market.id);
+      market.last_price = livePrice;
+    }
+
     res.json({
       id: market.id,
-      asset: (market.underlying || "TSLA") + "X",
+      asset: market.underlying || "TSLA",
       date: market.date,
       status: market.status,
       opened_at: market.opened_at,
@@ -539,9 +600,9 @@ app.get("/api/markets/latest", async (req, res) => {
       pct_down,
       total_votes: totalVotes,
       volume_usdc: volumeUsdc,
-      open_price: null,
-      current_price: null,
-      wallet_url: null,
+      open_price: market.open_price ?? null,
+      current_price: livePrice,
+      wallet_url: null, // se un giorno vuoi linkare TSLAx nel wallet
     });
   } catch (e) {
     console.error("Error in /api/markets/latest", e);
